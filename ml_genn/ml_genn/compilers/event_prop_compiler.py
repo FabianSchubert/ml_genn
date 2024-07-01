@@ -514,8 +514,7 @@ class EventPropCompiler(Compiler):
                 )
 
             sce_loss, mg_loss = [
-                loss_type is t
-                for t in (SparseCategoricalCrossentropy, SetTargetGeneric)
+                loss_type is t for t in (SparseCategoricalCrossentropy, ManualGradient)
             ]
 
             # Add output logic to model

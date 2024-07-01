@@ -14,6 +14,11 @@ class ManualGradient(Loss):
         # the provided loss function should take the input/predictions as the first argument.
         self.grad_loss = grad(loss_func)
 
+    def add_to_neuron(
+        self, model: NeuronModel, shape, batch_size: int, example_timesteps: int
+    ):
+        pass
+
     def set_target(
         self,
         genn_pop,
@@ -36,7 +41,7 @@ class ManualGradient(Loss):
             genn_pop.extra_global_params["RingV"].view[:], expected_shape
         )
 
-        gradients = self.grad_loss(voltages, y_true)
+        gradients = -self.grad_loss(voltages, y_true)
 
         genn_pop.extra_global_params["Gradient"].view[:] = gradients.flatten()
         genn_pop.extra_global_params["Gradient"].push_to_device()
