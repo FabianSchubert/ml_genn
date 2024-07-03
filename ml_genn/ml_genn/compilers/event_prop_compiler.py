@@ -26,7 +26,7 @@ from ..connection import Connection
 from ..losses import Loss, SparseCategoricalCrossentropy, ManualGradient
 from ..neurons import Input, LeakyIntegrate, LeakyIntegrateFire, LeakyIntegrateFireInput
 from ..optimisers import Optimiser
-from ..readouts import Var, AvgVar, AvgVarExpWeight, MaxVar, SumVar
+from ..readouts import Var, VarTrial, AvgVar, AvgVarExpWeight, MaxVar, SumVar
 from ..synapses import Exponential
 from ..utils.callback_list import CallbackList
 from ..utils.data import MetricsType
@@ -523,6 +523,8 @@ class EventPropCompiler(Compiler):
                 max_time_required=True,
                 dt=self.dt,
                 example_timesteps=self.example_timesteps,
+                batch_size=self.batch_size,
+                pop_shape=pop.shape,
             )
 
             if sce_loss:
@@ -580,7 +582,7 @@ class EventPropCompiler(Compiler):
                     model_copy.add_var("RingWriteOffset", "int", 0)
                     model_copy.add_var("RingReadOffset", "int", 0)
 
-                    if loss_type is SparseCategoricalCrossentropy:
+                    if sce_loss:
                         # Add EGP for softmax V ring variable
                         ring_size = (
                             self.batch_size
@@ -605,11 +607,12 @@ class EventPropCompiler(Compiler):
                             * self.example_timesteps
                         )
 
-                        model_copy.add_egp(
-                            "RingV",
-                            "scalar*",
-                            np.empty(ring_size, dtype=np.float32),
-                        )
+                        # **NOTE** the ring buffer for the voltage should already be added by the readout
+                        # model_copy.add_egp(
+                        #    "RingV",
+                        #    "scalar*",
+                        #    np.empty(ring_size, dtype=np.float32),
+                        # )
 
                         model_copy.add_egp(
                             "Gradient",
@@ -659,17 +662,19 @@ class EventPropCompiler(Compiler):
                         # Is it possible that this is just to check if any readout mode OTHER than AvgVar or SumVar
                         # such as "spike_count" is used (which would definitely make no sense in the context of EventProp, because the gradients
                         # of the spike count with respect to spike times or voltages would be zero)?
-                        if isinstance(pop.neuron.readout, Var):
+                        if isinstance(pop.neuron.readout, VarTrial):
                             model_copy.prepend_sim_code(
                                 f"""
                                 const unsigned int timestep = min((int)(t / dt), {self.example_timesteps - 1});
                                 // **NOTE** The ordering of the indices might be wrong.
                                 // index for reversed time.
-                                unsigned int index = (({self.example_timesteps} - 1 - timestep) * num_batch * num_neurons) + (batch * num_neurons) + id;
+                                unsigned int index = batch * {self.example_timesteps} * num_neurons + (({self.example_timesteps} - 1 - timestep) * num_neurons) + id;
 
                                 if (Trial > 0) {{
                                     const scalar grad = Gradient[index];
-                                    drive = grad / (TauM * num_batch * {self.dt * self.example_timesteps});
+                                    drive = -grad;
+                                    // why is drive being scaled? I think in the manual case, this is not necessary.
+                                    //drive = -grad / (TauM * num_batch * {self.dt * self.example_timesteps});
                                 }}
                                 """
                             )
@@ -677,19 +682,20 @@ class EventPropCompiler(Compiler):
                             compile_state.add_neuron_reset_vars(
                                 pop, reset_vars, False, True
                             )
-                            # Add code to store voltages.
-                            model_copy.append_sim_code(
-                                """
-                                // index for forward time.
-                                // **NOTE** The ordering of the indices might be wrong.
-                                index = (timestep * num_batch * num_neurons) + (batch * num_neurons) + id;
-                                RingV[index] = V;
-                                """
-                            )
+
+                            # **NOTE** The code for storing the voltages should have been added by the readout
+                            # model_copy.append_sim_code(
+                            #    """
+                            #    // index for forward time.
+                            #    // **NOTE** The ordering of the indices might be wrong.
+                            #    index = (timestep * num_batch * num_neurons) + (batch * num_neurons) + id;
+                            #    RingV[index] = V;
+                            #    """
+                            # )
                         else:
                             raise NotImplementedError(
                                 "EventProp compiler with SetTargetGeneric loss only supports "
-                                "'Var' readouts"
+                                "'VarTrial' readouts"
                             )
 
                     # Otherwise, unsupported readout type
