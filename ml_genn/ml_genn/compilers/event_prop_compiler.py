@@ -263,12 +263,15 @@ weight_update_model = {
     """,
 }
 
-# EventProp weight update model used on KERNEL weights when atomics required
+# EventProp weight update model used on KERNEL weights
 # **NOTE** feedback is added if required
-# **YUCK** you should NEVER have to use backend-specific code in models
-weight_update_model_atomic_cuda = {
+weight_update_model_kernel = {
     "params": [("TauSyn", "scalar")],
     "vars": [("g", "scalar", VarAccess.READ_ONLY), ("Gradient", "scalar")],
+
+    "pre_neuron_var_refs": [("BackSpike_pre", "uint8_t")],
+    "post_neuron_var_refs": [("LambdaI_post", "scalar")],
+
     "pre_spike_syn_code": """
     addToPost(g);
     """,
@@ -276,9 +279,8 @@ weight_update_model_atomic_cuda = {
     BackSpike_pre
     """,
     "pre_event_syn_code": """
-    atomicAdd(&Gradient, -(LambdaI_post * TauSyn));
-    """,
-}
+    atomic_add_Gradient(-(LambdaI_post * TauSyn));
+    """}
 
 # Weight update model used on non-trainable connections
 # **NOTE** feedback is added if required
@@ -360,8 +362,9 @@ class EventPropCompiler(Compiler):
     """Compiler for training models using EventProp [Wunderlich2021]_.
 
     The EventProp compiler supports :class:`ml_genn.neurons.LeakyIntegrateFire`
-    hidden neuron models and the :class:`ml_genn.losses.SparseCategoricalCrossentropy`
-    loss functions for classification.
+    hidden neuron models; and :class:`ml_genn.losses.SparseCategoricalCrossentropy` loss functions for classification
+    and :class:`ml_genn.losses.MeanSquareError` for regression.
+
 
     EventProp implements a fully event-driven backward pass meaning that its memory
     overhead scales with the number of spikes per-trial rather than sequence length.
@@ -501,8 +504,11 @@ class EventPropCompiler(Compiler):
 
         # If population has a readout i.e. it's an output
         if pop.neuron.readout is not None:
+            sce_loss = isinstance(compile_state.losses[pop], SparseCategoricalCrossentropy)
+            mse_loss = isinstance(compile_state.losses[pop], MeanSquareError)
             # Check loss function is compatible
             # **TODO** categorical crossentropy i.e. one-hot encoded
+
             loss = compile_state.losses[pop]
             loss_type = type(loss)
             if not isinstance(
@@ -519,6 +525,7 @@ class EventPropCompiler(Compiler):
 
             # Add output logic to model
             model_copy = pop.neuron.readout.add_readout_logic(
+
                 model_copy,
                 max_time_required=True,
                 dt=self.dt,
@@ -571,6 +578,7 @@ class EventPropCompiler(Compiler):
                     LambdaV = drive + ((LambdaV - drive) * Alpha);
                     """
                 )
+
 
                 # If we want to calculate per-timestep loss
                 if self.per_timestep_loss or mg_loss:
@@ -628,6 +636,7 @@ class EventPropCompiler(Compiler):
                                 const int ringOffset = (batch * num_neurons * {2 * self.example_timesteps}) + (id * {2 * self.example_timesteps});
                                 if (Trial > 0) {{
                                     RingReadOffset--;
+
                                     const scalar softmax = RingSoftmaxV[ringOffset + RingReadOffset];
                                     const scalar g = (id == YTrueBack) ? (1.0 - softmax) : -softmax;
                                     drive = g / (TauM * num_batch * {self.dt * self.example_timesteps});
@@ -799,7 +808,6 @@ class EventPropCompiler(Compiler):
                             f"EventProp compiler doesn't support "
                             f"{type(pop.neuron.readout).__name__} readouts"
                         )
-
                 # Prepend standard code to update LambdaV and LambdaI
                 model_copy.prepend_sim_code(
                     f"""
@@ -1050,21 +1058,15 @@ class EventPropCompiler(Compiler):
                     "EventProp compiler only " "supports Exponential synapses"
                 )
 
-            # Determine whether atomic weight updates are required
-            # **YUCK** backend-specific code shouldn't be required in models
-            # **TODO** something when OpenCL
-            use_atomic = (
-                connect_snippet.matrix_type & SynapseMatrixWeight.KERNEL
-            ) and compile_state.backend_name == "CUDA"
-            assert not use_atomic
 
+            # Determine whether kernel updates are required
+            use_kernel = (
+                connect_snippet.matrix_type & SynapseMatrixWeight.KERNEL)
+            
             # Create basic weight update model
             wum = WeightUpdateModel(
-                model=deepcopy(
-                    weight_update_model_atomic_cuda
-                    if use_atomic
-                    else weight_update_model
-                ),
+                model=deepcopy(weight_update_model_kernel if use_kernel
+                               else weight_update_model),
                 param_vals={"TauSyn": tau_syn},
                 var_vals={"g": connect_snippet.weight, "Gradient": 0.0},
                 pre_neuron_var_refs={"BackSpike_pre": "BackSpike"},
@@ -1236,30 +1238,21 @@ class EventPropCompiler(Compiler):
         # third softmax pass and add to model
         softmax_3 = CustomUpdateModel(
             {
-                "var_refs": [
-                    ("Val", "scalar", VarAccessMode.READ_ONLY),
-                    ("MaxVal", "scalar", VarAccessMode.READ_ONLY),
-                    ("SumExpVal", "scalar", VarAccessMode.READ_ONLY),
-                    ("RingWriteOffset", "int"),
-                ],
-                "extra_global_param_refs": [("RingSoftmaxV", "scalar*")],
+
+                "var_refs": [("Val", "scalar", VarAccessMode.READ_ONLY),
+                             ("MaxVal", "scalar", VarAccessMode.READ_ONLY),
+                             ("SumExpVal", "scalar", VarAccessMode.READ_ONLY),
+                             ("RingWriteOffset", "int")],
+                "extra_global_param_refs": [("RingOutputLossTerm", "scalar*")],
+
                 "update_code": f"""
                 const int ringOffset = (batch * num_neurons * {2 * self.example_timesteps}) + (id * {2 * self.example_timesteps});
-                RingSoftmaxV[ringOffset + RingWriteOffset]= exp(Val - MaxVal) / SumExpVal;
+                RingOutputLossTerm[ringOffset + RingWriteOffset]= exp(Val - MaxVal) / SumExpVal;
                 RingWriteOffset++;
                 """,
             },
             {},
-            {},
-            {
-                "Val": create_var_ref(genn_pop, input_var_name),
-                "MaxVal": create_var_ref(genn_softmax_1, "MaxVal"),
-                "SumExpVal": create_var_ref(genn_softmax_2, "SumExpVal"),
-                "RingWriteOffset": create_var_ref(genn_pop, "RingWriteOffset"),
-            },
-            {},
-            {"RingSoftmaxV": create_egp_ref(genn_pop, "RingSoftmaxV")},
-        )
+            {"RingOutputLossTerm": create_egp_ref(genn_pop, "RingOutputLossTerm")})
 
         self.add_custom_update(
             genn_model, softmax_3, "Softmax3", "CUSoftmax3" + genn_pop.name
