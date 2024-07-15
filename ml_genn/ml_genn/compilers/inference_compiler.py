@@ -23,37 +23,53 @@ from ..metrics import default_metrics
 
 
 class CompiledInferenceNetwork(CompiledNetwork):
-    def __init__(self, genn_model, neuron_populations,
-                 connection_populations, communicator,
-                 evaluate_timesteps: int, base_callbacks: list,
-                 reset_time_between_batches: bool = True):
+    def __init__(
+        self,
+        genn_model,
+        neuron_populations,
+        connection_populations,
+        communicator,
+        evaluate_timesteps: int,
+        base_callbacks: list,
+        reset_time_between_batches: bool = True,
+    ):
         super(CompiledInferenceNetwork, self).__init__(
-            genn_model, neuron_populations, connection_populations,
-            communicator, evaluate_timesteps)
+            genn_model,
+            neuron_populations,
+            connection_populations,
+            communicator,
+            evaluate_timesteps,
+        )
 
         self.evaluate_timesteps = evaluate_timesteps
         self.base_callbacks = base_callbacks
         self.reset_time_between_batches = reset_time_between_batches
 
-    def evaluate(self, x: dict, y: dict,
-                 metrics: MetricsType = "sparse_categorical_accuracy",
-                 callbacks=[BatchProgressBar()]):
-        """ Evaluate metrics on a numpy dataset
-        """
+    def evaluate(
+        self,
+        x: dict,
+        y: dict,
+        metrics: MetricsType = "sparse_categorical_accuracy",
+        callbacks=[BatchProgressBar()],
+    ):
+        """Evaluate metrics on a numpy dataset"""
         # Determine the number of elements in x and y
         x_size = get_dataset_size(x)
         y_size = get_dataset_size(y)
 
         # Build metrics
-        metrics = get_object_mapping(metrics, y.keys(), Metric, 
-                                     "Metric", default_metrics)
+        metrics = get_object_mapping(
+            metrics, y.keys(), Metric, "Metric", default_metrics
+        )
 
         if x_size is None:
-            raise RuntimeError("Each input population must be "
-                               " provided with same number of inputs")
+            raise RuntimeError(
+                "Each input population must be " " provided with same number of inputs"
+            )
         if y_size is None:
-            raise RuntimeError("Each output population must be "
-                               " provided with same number of labels")
+            raise RuntimeError(
+                "Each output population must be " " provided with same number of labels"
+            )
         if x_size != y_size:
             raise RuntimeError("Number of inputs and labels must match")
 
@@ -63,15 +79,14 @@ class CompiledInferenceNetwork(CompiledNetwork):
         y = batch_dataset(y, batch_size, y_size)
 
         # Create callback list and begin testing
-        callback_list = CallbackList(self.base_callbacks + callbacks,
-                                     compiled_network=self,
-                                     num_batches=len(x))
+        callback_list = CallbackList(
+            self.base_callbacks + callbacks, compiled_network=self, num_batches=len(x)
+        )
         callback_list.on_test_begin()
 
         # Loop through batches and evaluate
         for batch_i, (x_batch, y_batch) in enumerate(zip(x, y)):
-            self._evaluate_batch(batch_i, x_batch, y_batch,
-                                 metrics, callback_list)
+            self._evaluate_batch(batch_i, x_batch, y_batch, metrics, callback_list)
 
         # End testing
         callback_list.on_test_end(metrics)
@@ -79,16 +94,20 @@ class CompiledInferenceNetwork(CompiledNetwork):
         # Return metrics
         return metrics, callback_list.get_data()
 
-    def predict(self, x: dict, outputs: Union[Sequence, PopulationType],
-                callbacks=[BatchProgressBar()]):
-        """ Generate predictions from a numpy dataset
-        """
+    def predict(
+        self,
+        x: dict,
+        outputs: Union[Sequence, PopulationType],
+        callbacks=[BatchProgressBar()],
+    ):
+        """Generate predictions from a numpy dataset"""
         # Determine the number of elements in x
         x_size = get_dataset_size(x)
 
         if x_size is None:
-            raise RuntimeError("Each input population must be "
-                               " provided with same number of inputs")
+            raise RuntimeError(
+                "Each input population must be " " provided with same number of inputs"
+            )
         # Batch x
         x = batch_dataset(x, self.genn_model.batch_size, x_size)
 
@@ -96,9 +115,9 @@ class CompiledInferenceNetwork(CompiledNetwork):
         outputs = outputs if isinstance(outputs, Sequence) else [outputs]
 
         # Create callback list and begin testing
-        callback_list = CallbackList(self.base_callbacks + callbacks,
-                                     compiled_network=self,
-                                     num_batches=len(x))
+        callback_list = CallbackList(
+            self.base_callbacks + callbacks, compiled_network=self, num_batches=len(x)
+        )
         callback_list.on_test_begin()
 
         # Build dictionary mapping from output to
@@ -111,11 +130,10 @@ class CompiledInferenceNetwork(CompiledNetwork):
             callback_list.on_batch_begin(batch)
 
             # Get predictions from each output on this batch
-            y_pred_batch = self._predict_batch(batch, x_batch, outputs,
-                                               callback_list)
+            y_pred_batch = self._predict_batch(batch, x_batch, outputs, callback_list)
 
             # Insert copies into dictionary
-            for o, y in  zip(outputs, y_pred_batch):
+            for o, y in zip(outputs, y_pred_batch):
                 y_pred[o].append(np.copy(y))
 
             # End batch
@@ -126,29 +144,36 @@ class CompiledInferenceNetwork(CompiledNetwork):
 
         # Concatenate predictions into single numpy array and trim padding
         for o in outputs:
-            y_pred[o] = np.concatenate(y_pred[o])[:x_size,:]
+            y_pred[o] = np.concatenate(y_pred[o])[:x_size, :]
 
         # Return predictions and metrics
         return y_pred, callback_list.get_data()
 
     def evaluate_batch_iter(
-            self, inputs, outputs, data: Iterator, num_batches: int = None,
-            metrics: MetricsType = "sparse_categorical_accuracy",
-            callbacks=[BatchProgressBar()]):
-        """ Evaluate metrics on an iterator that provides batches of a dataset
-        """
+        self,
+        inputs,
+        outputs,
+        data: Iterator,
+        num_batches: int = None,
+        metrics: MetricsType = "sparse_categorical_accuracy",
+        callbacks=[BatchProgressBar()],
+    ):
+        """Evaluate metrics on an iterator that provides batches of a dataset"""
         # Convert inputs and outputs to tuples
         inputs = inputs if isinstance(inputs, Sequence) else (inputs,)
         outputs = outputs if isinstance(outputs, Sequence) else (outputs,)
 
         # Build metrics
-        metrics = get_object_mapping(metrics, outputs, Metric, 
-                                     "Metric", default_metrics)
+        metrics = get_object_mapping(
+            metrics, outputs, Metric, "Metric", default_metrics
+        )
 
         # Create callback list and begin testing
-        callback_list = CallbackList(self.base_callbacks + callbacks,
-                                     compiled_network=self,
-                                     num_batches=num_batches)
+        callback_list = CallbackList(
+            self.base_callbacks + callbacks,
+            compiled_network=self,
+            num_batches=num_batches,
+        )
         callback_list.on_test_begin()
 
         # Loop through data
@@ -187,17 +212,18 @@ class CompiledInferenceNetwork(CompiledNetwork):
         # Return metrics
         return metrics, callback_list.get_data()
 
-    def evaluate_batch(self, x: dict, y: dict,
-                       metrics="sparse_categorical_accuracy",
-                       callbacks=[]):
+    def evaluate_batch(
+        self, x: dict, y: dict, metrics="sparse_categorical_accuracy", callbacks=[]
+    ):
         # Build metrics
-        metrics = get_object_mapping(metrics, y.keys(), Metric, 
-                                     "Metric", default_metrics)
+        metrics = get_object_mapping(
+            metrics, y.keys(), Metric, "Metric", default_metrics
+        )
 
         # Create callback list and begin testing
-        callback_list = CallbackList(self.base_callbacks + callbacks,
-                                     compiled_network=self,
-                                     num_batches=1)
+        callback_list = CallbackList(
+            self.base_callbacks + callbacks, compiled_network=self, num_batches=1
+        )
         callback_list.on_test_begin()
 
         # Evaluate batch and return metrics
@@ -208,9 +234,10 @@ class CompiledInferenceNetwork(CompiledNetwork):
 
         return metrics, callback_list.get_data()
 
-    def _predict_batch(self, batch: int, x: dict, outputs: Sequence,
-                       callback_list: CallbackList):
-        """ Generate predictions from a single batch of inputs
+    def _predict_batch(
+        self, batch: int, x: dict, outputs: Sequence, callback_list: CallbackList
+    ):
+        """Generate predictions from a single batch of inputs
         Args:
         batch --    index of current batch
         x --        dict mapping input Population or InputLayer to
@@ -231,9 +258,10 @@ class CompiledInferenceNetwork(CompiledNetwork):
         # Return predictions from model
         return self.get_readout(outputs)
 
-    def _evaluate_batch(self, batch: int, x: dict, y: dict, metrics,
-                        callback_list: CallbackList):
-        """ Evaluate a single batch of inputs against labels
+    def _evaluate_batch(
+        self, batch: int, x: dict, y: dict, metrics, callback_list: CallbackList
+    ):
+        """Evaluate a single batch of inputs against labels
         Args:
         batch --    index of current batch
         x --        dict mapping input Population or InputLayer to
@@ -249,8 +277,7 @@ class CompiledInferenceNetwork(CompiledNetwork):
 
         # Update metrics
         for (o, y_true), out_y_pred in zip(y.items(), y_pred):
-            metrics[o].update(y_true, out_y_pred[:len(y_true)],
-                              self.communicator)
+            metrics[o].update(y_true, out_y_pred[: len(y_true)], self.communicator)
 
         # End batch
         callback_list.on_batch_end(batch, metrics)
@@ -278,87 +305,102 @@ class CompileState:
         if len(reset_vars) > 0:
             self._psm_reset_vars[conn] = reset_vars
 
-    def create_reset_custom_updates(self, compiler, genn_model,
-                                    neuron_pops, conn_pops):
+    def create_reset_custom_updates(self, compiler, genn_model, neuron_pops, conn_pops):
         # Loop through neuron variables to reset
         for i, (pop, reset_vars) in enumerate(self._neuron_reset_vars.items()):
             # Create reset model
             model = create_reset_custom_update(
-                reset_vars,
-                lambda name: create_var_ref(neuron_pops[pop], name))
+                reset_vars, lambda name: create_var_ref(neuron_pops[pop], name)
+            )
 
             # Add custom update
-            compiler.add_custom_update(genn_model, model, 
-                                       "Reset", f"CUResetNeuron{i}")
+            compiler.add_custom_update(genn_model, model, "Reset", f"CUResetNeuron{i}")
 
         # Loop through psm variables to reset
         for i, (conn, reset_vars) in enumerate(self._psm_reset_vars.items()):
             # Create reset model
             model = create_reset_custom_update(
-                reset_vars,
-                lambda name: create_psm_var_ref(conn_pops[conn], name))
+                reset_vars, lambda name: create_psm_var_ref(conn_pops[conn], name)
+            )
 
             # Add custom update
-            compiler.add_custom_update(genn_model, model, 
-                                       "Reset", f"CUResetPSM{i}")
+            compiler.add_custom_update(genn_model, model, "Reset", f"CUResetPSM{i}")
 
 
 class InferenceCompiler(Compiler):
-    def __init__(self, evaluate_timesteps: int, dt: float = 1.0,
-                 batch_size: int = 1, rng_seed: int = 0,
-                 kernel_profiling: bool = False,
-                 prefer_in_memory_connect=True, 
-                 reset_time_between_batches=True,
-                 reset_vars_between_batches=True,
-                 reset_in_syn_between_batches=False,
-                 communicator: Communicator = None,
-                 **genn_kwargs):
+    def __init__(
+        self,
+        evaluate_timesteps: int,
+        dt: float = 1.0,
+        batch_size: int = 1,
+        rng_seed: int = 0,
+        kernel_profiling: bool = False,
+        prefer_in_memory_connect=True,
+        reset_time_between_batches=True,
+        reset_vars_between_batches=True,
+        reset_in_syn_between_batches=False,
+        communicator: Communicator = None,
+        **genn_kwargs,
+    ):
         # Determine matrix type order of preference based on flag
         if prefer_in_memory_connect:
-            supported_matrix_type = [SynapseMatrixType.SPARSE,
-                                     SynapseMatrixType.DENSE,
-                                     SynapseMatrixType.TOEPLITZ,
-                                     SynapseMatrixType.PROCEDURAL_KERNELG,
-                                     SynapseMatrixType.PROCEDURAL]
+            supported_matrix_type = [
+                SynapseMatrixType.SPARSE,
+                SynapseMatrixType.DENSE,
+                SynapseMatrixType.TOEPLITZ,
+                SynapseMatrixType.PROCEDURAL_KERNELG,
+                SynapseMatrixType.PROCEDURAL,
+            ]
         else:
-            supported_matrix_type = [SynapseMatrixType.TOEPLITZ,
-                                     SynapseMatrixType.PROCEDURAL_KERNELG,
-                                     SynapseMatrixType.PROCEDURAL,
-                                     SynapseMatrixType.SPARSE,
-                                     SynapseMatrixType.DENSE]
-        super(InferenceCompiler, self).__init__(supported_matrix_type, dt,
-                                                batch_size, rng_seed,
-                                                kernel_profiling,
-                                                communicator,
-                                                **genn_kwargs)
+            supported_matrix_type = [
+                SynapseMatrixType.TOEPLITZ,
+                SynapseMatrixType.PROCEDURAL_KERNELG,
+                SynapseMatrixType.PROCEDURAL,
+                SynapseMatrixType.SPARSE,
+                SynapseMatrixType.DENSE,
+            ]
+        super(InferenceCompiler, self).__init__(
+            supported_matrix_type,
+            dt,
+            batch_size,
+            rng_seed,
+            kernel_profiling,
+            communicator,
+            **genn_kwargs,
+        )
         self.evaluate_timesteps = evaluate_timesteps
         self.reset_time_between_batches = reset_time_between_batches
         self.reset_vars_between_batches = reset_vars_between_batches
         self.reset_in_syn_between_batches = reset_in_syn_between_batches
 
-    def pre_compile(self, network: Network, 
-                    genn_model, **kwargs) -> CompileState:
+    def pre_compile(self, network: Network, genn_model, **kwargs) -> CompileState:
         return CompileState()
 
-    def build_neuron_model(self, pop: Population, model: NeuronModel,
-                           compile_state: CompileState) -> NeuronModel:
+    def build_neuron_model(
+        self, pop: Population, model: NeuronModel, compile_state: CompileState
+    ) -> NeuronModel:
         # If population has a readout i.e. it's an output
         # Add readout logic to model
         if pop.neuron.readout is not None:
             model = pop.neuron.readout.add_readout_logic(
-                model, example_timesteps=self.evaluate_timesteps,
-                dt=self.dt)
+                model,
+                dt=self.dt,
+                example_timesteps=self.evaluate_timesteps,
+                batch_size=self.batch_size,
+                pop_shape=pop.shape,
+            )
 
         # Add any neuron reset variables to compile state
-        compile_state.add_neuron_reset_vars(model, pop,
-                                            self.reset_vars_between_batches)
+        compile_state.add_neuron_reset_vars(model, pop, self.reset_vars_between_batches)
 
         # Build neuron model
         return super(InferenceCompiler, self).build_neuron_model(
-            pop, model, compile_state)
+            pop, model, compile_state
+        )
 
-    def build_synapse_model(self, conn: Connection, model: SynapseModel,
-                            compile_state: CompileState) -> SynapseModel:
+    def build_synapse_model(
+        self, conn: Connection, model: SynapseModel, compile_state: CompileState
+    ) -> SynapseModel:
         # Add any PSM reset variables to compile state
         if self.reset_vars_between_batches:
             compile_state.add_psm_reset_vars(model, conn)
@@ -369,15 +411,20 @@ class InferenceCompiler(Compiler):
             compile_state.in_syn_zero_conns.append(conn)
 
         return super(InferenceCompiler, self).build_synapse_model(
-            conn, model, compile_state)
+            conn, model, compile_state
+        )
 
-    def create_compiled_network(self, genn_model, neuron_populations: dict,
-                                connection_populations: dict,
-                                compile_state: CompileState) -> CompiledInferenceNetwork:
+    def create_compiled_network(
+        self,
+        genn_model,
+        neuron_populations: dict,
+        connection_populations: dict,
+        compile_state: CompileState,
+    ) -> CompiledInferenceNetwork:
         # Create custom updates to implement variable reset
-        compile_state.create_reset_custom_updates(self, genn_model,
-                                                  neuron_populations,
-                                                  connection_populations)
+        compile_state.create_reset_custom_updates(
+            self, genn_model, neuron_populations, connection_populations
+        )
 
         base_callbacks = [CustomUpdateOnBatchBegin("Reset")]
 
@@ -388,9 +435,12 @@ class InferenceCompiler(Compiler):
             for c in compile_state.in_syn_zero_conns:
                 base_callbacks.append(ZeroInSyn(connection_populations[c]))
 
-        return CompiledInferenceNetwork(genn_model, neuron_populations,
-                                        connection_populations,
-                                        self.communicator,
-                                        self.evaluate_timesteps,
-                                        base_callbacks,
-                                        self.reset_time_between_batches)
+        return CompiledInferenceNetwork(
+            genn_model,
+            neuron_populations,
+            connection_populations,
+            self.communicator,
+            self.evaluate_timesteps,
+            base_callbacks,
+            self.reset_time_between_batches,
+        )

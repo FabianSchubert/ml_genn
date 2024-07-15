@@ -3,26 +3,39 @@ import numpy as np
 
 from string import Template
 from typing import Iterator, Sequence
-from pygenn import (CustomUpdateVarAccess, VarAccess, VarAccessMode,
-                    SynapseMatrixType, SynapseMatrixWeight)
+from pygenn import (
+    CustomUpdateVarAccess,
+    VarAccess,
+    VarAccessMode,
+    SynapseMatrixType,
+    SynapseMatrixWeight,
+)
 
 from .compiler import Compiler
 from .compiled_training_network import CompiledTrainingNetwork
 from .. import Connection, Population, Network
-from ..callbacks import (BatchProgressBar, Callback, CustomUpdateOnBatchBegin,
-                         CustomUpdateOnBatchEnd, CustomUpdateOnTimestepEnd)
+from ..callbacks import (
+    BatchProgressBar,
+    Callback,
+    CustomUpdateOnBatchBegin,
+    CustomUpdateOnBatchEnd,
+    CustomUpdateOnTimestepEnd,
+)
 from ..communicators import Communicator
 from ..connection import Connection
-from ..losses import Loss, SparseCategoricalCrossentropy, MeanSquareError
-from ..neurons import (Input, LeakyIntegrate, LeakyIntegrateFire,
-                       LeakyIntegrateFireInput)
+from ..losses import Loss, SparseCategoricalCrossentropy, ManualGradient
+from ..neurons import Input, LeakyIntegrate, LeakyIntegrateFire, LeakyIntegrateFireInput
 from ..optimisers import Optimiser
-from ..readouts import AvgVar, AvgVarExpWeight, MaxVar, SumVar, Var
+from ..readouts import Var, VarTrial, AvgVar, AvgVarExpWeight, MaxVar, SumVar
 from ..synapses import Exponential
 from ..utils.callback_list import CallbackList
 from ..utils.data import MetricsType
-from ..utils.model import (CustomUpdateModel, NeuronModel, 
-                           SynapseModel, WeightUpdateModel)
+from ..utils.model import (
+    CustomUpdateModel,
+    NeuronModel,
+    SynapseModel,
+    WeightUpdateModel,
+)
 from ..utils.network import PopulationType
 from ..utils.snippet import ConnectivitySnippet
 
@@ -42,11 +55,11 @@ logger = logging.getLogger(__name__)
 # EventProp uses a fixed size ring-buffer structure with a read pointer to
 # read data for the backward pass and a write pointer to write data from the
 # forward pass. These start positioned like this:
-# 
+#
 # RingReadEndOffset   RingWriteStartOffset
 #        V                    V
 #        |--------------------|--------------------
-#        | Backward pass data | Forward pass data  
+#        | Backward pass data | Forward pass data
 #        |--------------------|--------------------
 #                            ^ ^
 #            <- RingReadOffset RingWriteOffset ->
@@ -61,9 +74,9 @@ logger = logging.getLogger(__name__)
 #        ^                                         ^
 # <- RingReadOffset                          RingWriteOffset ->
 #
-# 
-# Then, a reset custom update points the read offset  
-# to the end of the previous forward pass's data and provides a new 
+#
+# Then, a reset custom update points the read offset
+# to the end of the previous forward pass's data and provides a new
 # space to write data from the next forward pass
 #
 #                     RingReadEndOffset    RingWriteStartOffset
@@ -74,18 +87,24 @@ logger = logging.getLogger(__name__)
 #                                                 ^ ^
 #                                 <- RingReadOffset RingWriteOffset ->
 #
-# Because the buffer is circular and all incrementing and decrementing of 
+# Because the buffer is circular and all incrementing and decrementing of
 # read and write offsets check for wraparound, this can continue forever
 # **NOTE** due to the inprecision of ASCII diagramming there are out-by-one errors in the above
 
 default_params = {
-    LeakyIntegrate: {"scale_i": True}, 
-    LeakyIntegrateFire: {"relative_reset": False, 
-                         "integrate_during_refrac": False,
-                         "scale_i": True},
-    LeakyIntegrateFireInput: {"relative_reset": False, 
-                              "integrate_during_refrac": False,
-                              "scale_i": True}}
+    LeakyIntegrate: {"scale_i": True},
+    LeakyIntegrateFire: {
+        "relative_reset": False,
+        "integrate_during_refrac": False,
+        "scale_i": True,
+    },
+    LeakyIntegrateFireInput: {
+        "relative_reset": False,
+        "integrate_during_refrac": False,
+        "scale_i": True,
+    },
+}
+
 
 def _get_tau_syn(pop):
     # Loop through incoming connections
@@ -95,24 +114,26 @@ def _get_tau_syn(pop):
         syn = conn().synapse
         if not isinstance(syn, Exponential):
             raise NotImplementedError(
-                "EventProp compiler only supports "
-                "Exponential synapses")
+                "EventProp compiler only supports " "Exponential synapses"
+            )
 
         # Update tau_syn
         if tau_syn is None:
             tau_syn = syn.tau
         if tau_syn != syn.tau:
-            raise NotImplementedError("EventProp compiler doesn't"
-                                      " support neurons whose "
-                                      "incoming synapses have "
-                                      "different time constants")
+            raise NotImplementedError(
+                "EventProp compiler doesn't"
+                " support neurons whose "
+                "incoming synapses have "
+                "different time constants"
+            )
     assert tau_syn is not None
     return tau_syn
 
+
 class CompileState:
     def __init__(self, losses, readouts, backend_name):
-        self.losses = get_object_mapping(losses, readouts,
-                                         Loss, "Loss", default_losses)
+        self.losses = get_object_mapping(losses, readouts, Loss, "Loss", default_losses)
         self.backend_name = backend_name
         self.weight_optimiser_connections = []
         self._neuron_reset_vars = []
@@ -123,35 +144,42 @@ class CompileState:
         self.feedback_connections = []
         self.update_trial_pops = []
 
-    def add_neuron_reset_vars(self, pop, reset_vars, 
-                              reset_event_ring, reset_v_ring):
-        self._neuron_reset_vars.append((pop, reset_vars, 
-                                        reset_event_ring, reset_v_ring))
+    def add_neuron_reset_vars(self, pop, reset_vars, reset_event_ring, reset_v_ring):
+        self._neuron_reset_vars.append(
+            (pop, reset_vars, reset_event_ring, reset_v_ring)
+        )
 
-    def create_reset_custom_updates(self, compiler, genn_model,
-                                    neuron_pops):
+    def create_reset_custom_updates(self, compiler, genn_model, neuron_pops):
         # Loop through neuron variables to reset
         for i, (pop, vars, r_ev, r_v) in enumerate(self._neuron_reset_vars):
             # Create reset model
             model = create_reset_custom_update(
-                vars,
-                lambda name: create_var_ref(neuron_pops[pop], name))
+                vars, lambda name: create_var_ref(neuron_pops[pop], name)
+            )
 
             # If we want to add code to reset event ring buffer
             if r_ev:
                 # Add references to ring buffer offsets
-                model.add_var_ref("RingReadOffset", "int",
-                                  create_var_ref(neuron_pops[pop],
-                                                 "RingReadOffset"))
-                model.add_var_ref("RingWriteOffset", "int", 
-                                  create_var_ref(neuron_pops[pop],
-                                                 "RingWriteOffset"))
-                model.add_var_ref("RingWriteStartOffset", "int", 
-                                  create_var_ref(neuron_pops[pop],
-                                                 "RingWriteStartOffset"))
-                model.add_var_ref("RingReadEndOffset", "int", 
-                                  create_var_ref(neuron_pops[pop],
-                                                 "RingReadEndOffset"))
+                model.add_var_ref(
+                    "RingReadOffset",
+                    "int",
+                    create_var_ref(neuron_pops[pop], "RingReadOffset"),
+                )
+                model.add_var_ref(
+                    "RingWriteOffset",
+                    "int",
+                    create_var_ref(neuron_pops[pop], "RingWriteOffset"),
+                )
+                model.add_var_ref(
+                    "RingWriteStartOffset",
+                    "int",
+                    create_var_ref(neuron_pops[pop], "RingWriteStartOffset"),
+                )
+                model.add_var_ref(
+                    "RingReadEndOffset",
+                    "int",
+                    create_var_ref(neuron_pops[pop], "RingReadEndOffset"),
+                )
 
                 # Add additional update code to update ring buffer offsets
                 model.append_update_code(
@@ -162,16 +190,21 @@ class CompileState:
                     }}
                     RingReadEndOffset = RingWriteStartOffset;
                     RingWriteStartOffset = RingReadOffset;
-                    """)
+                    """
+                )
             # Otherwise, if we want to add code to reset a voltage ring buffer
             elif r_v:
                 # Add references to ring buffer offsets
-                model.add_var_ref("RingReadOffset", "int",
-                                  create_var_ref(neuron_pops[pop],
-                                                 "RingReadOffset"))
-                model.add_var_ref("RingWriteOffset", "int", 
-                                  create_var_ref(neuron_pops[pop],
-                                                 "RingWriteOffset"))
+                model.add_var_ref(
+                    "RingReadOffset",
+                    "int",
+                    create_var_ref(neuron_pops[pop], "RingReadOffset"),
+                )
+                model.add_var_ref(
+                    "RingWriteOffset",
+                    "int",
+                    create_var_ref(neuron_pops[pop], "RingWriteOffset"),
+                )
                 # Add additional update code to update ring buffer offsets
                 model.append_update_code(
                     f"""
@@ -179,11 +212,11 @@ class CompileState:
                     if (RingWriteOffset >= {2 * compiler.example_timesteps}) {{
                         RingWriteOffset = 0;
                     }}
-                    """)
-            
+                    """
+                )
+
             # Add custom update
-            compiler.add_custom_update(genn_model, model, 
-                                       "Reset", f"CUResetNeuron{i}")
+            compiler.add_custom_update(genn_model, model, "Reset", f"CUResetNeuron{i}")
 
     @property
     def is_reset_custom_update_required(self):
@@ -198,7 +231,8 @@ class UpdateTrial(Callback):
         # Set dynamic parameter to batch ID
         self.genn_pop.set_dynamic_param_value("Trial", batch)
 
-# Callback which clamps in_syn to 0 one timestep before  
+
+# Callback which clamps in_syn to 0 one timestep before
 # trial end to avoid bleeding spikes into the next trial
 class ZeroInSynLastTimestep(Callback):
     def __init__(self, genn_syn_pop, example_timesteps: int):
@@ -207,8 +241,9 @@ class ZeroInSynLastTimestep(Callback):
 
     def on_timestep_begin(self, timestep: int):
         if timestep == (self.example_timesteps - 1):
-            self.genn_syn_pop.out_post.view[:]= 0.0
+            self.genn_syn_pop.out_post.view[:] = 0.0
             self.genn_syn_pop.out_post.push_to_device()
+
 
 # Standard EventProp weight update model
 # **NOTE** feedback is added if required
@@ -217,7 +252,6 @@ weight_update_model = {
     "vars": [("g", "scalar", VarAccess.READ_ONLY), ("Gradient", "scalar")],
     "pre_neuron_var_refs": [("BackSpike_pre", "uint8_t")],
     "post_neuron_var_refs": [("LambdaI_post", "scalar")],
-                             
     "pre_spike_syn_code": """
     addToPost(g);
     """,
@@ -226,13 +260,15 @@ weight_update_model = {
     """,
     "pre_event_syn_code": """
     Gradient -= (LambdaI_post * TauSyn);
-    """}
+    """,
+}
 
 # EventProp weight update model used on KERNEL weights
 # **NOTE** feedback is added if required
 weight_update_model_kernel = {
     "params": [("TauSyn", "scalar")],
     "vars": [("g", "scalar", VarAccess.READ_ONLY), ("Gradient", "scalar")],
+
     "pre_neuron_var_refs": [("BackSpike_pre", "uint8_t")],
     "post_neuron_var_refs": [("LambdaI_post", "scalar")],
 
@@ -251,13 +287,13 @@ weight_update_model_kernel = {
 static_weight_update_model = {
     "params": [("g", "scalar")],
     "pre_neuron_var_refs": [("BackSpike_pre", "uint8_t")],
-    "pre_spike_syn_code":
-        """
+    "pre_spike_syn_code": """
         addToPost(g);
         """,
     "pre_event_threshold_condition_code": """
     BackSpike_pre
-    """}
+    """,
+}
 
 gradient_batch_reduce_model = {
     "vars": [("ReducedGradient", "scalar", CustomUpdateVarAccess.REDUCE_BATCH_SUM)],
@@ -265,7 +301,8 @@ gradient_batch_reduce_model = {
     "update_code": """
     ReducedGradient = Gradient;
     Gradient = 0;
-    """}
+    """,
+}
 
 # Template used to generate backward passes for neurons
 neuron_backward_pass = Template(
@@ -291,7 +328,8 @@ neuron_backward_pass = Template(
     }
 
     // Forward pass
-    """)
+    """
+)
 
 # Template used to generate reset code for neurons
 neuron_reset = Template(
@@ -308,7 +346,8 @@ neuron_reset = Template(
         }
     }
     $strict_check
-    """)
+    """
+)
 
 # Code used to add optional strict checking after neuron reset
 neuron_reset_strict_check = """
@@ -318,6 +357,7 @@ neuron_reset_strict_check = """
     }
     """
 
+
 class EventPropCompiler(Compiler):
     """Compiler for training models using EventProp [Wunderlich2021]_.
 
@@ -325,34 +365,35 @@ class EventPropCompiler(Compiler):
     hidden neuron models; and :class:`ml_genn.losses.SparseCategoricalCrossentropy` loss functions for classification
     and :class:`ml_genn.losses.MeanSquareError` for regression.
 
-    EventProp implements a fully event-driven backward pass meaning that its memory 
-    overhead scales with the number of spikes per-trial rather than sequence length. 
-    
-    In the original paper, [Wunderlich2021]_ 
+
+    EventProp implements a fully event-driven backward pass meaning that its memory
+    overhead scales with the number of spikes per-trial rather than sequence length.
+
+    In the original paper, [Wunderlich2021]_
     derived EventProp to support loss functions of the form:
 
     .. math::
 
         {\\cal L} = l_p(t^{\\text{post}}) + \\int_0^T l_V(V(t),t) dt
-    
+
     such as
 
     .. math::
 
         l_V= -\\frac{1}{N_{\\text{batch}}} \\sum_{m=1}^{N_{\\text{batch}}} \\log \\left( \\frac{\\exp\\left(V_{l(m)}^m(t)\\right)}{\\sum_{k=1}^{N_{\\text{class}}} \\exp\\left(V_{k}^m(t) \\right)} \\right)
-    
+
     where a function of output neuron membrane voltage is calculated each
     timestep -- in mlGeNN, we refer to these as *per-timestep loss functions*.
-    However, [Nowotny2024]_ showed that tasks with more complex temporal 
-    structure cannot be learned using these loss functions and extended 
+    However, [Nowotny2024]_ showed that tasks with more complex temporal
+    structure cannot be learned using these loss functions and extended
     the framework to support loss functions of the form:
 
     .. math::
 
         {\\cal L}_F = F\\left(\\textstyle \\int_0^T l_V(V(t),t) \\, dt\\right)
-    
+
     such as:
-    
+
     .. math::
 
         {\\mathcal L_{\\text{sum}}} = - \\frac{1}{N_{\\text{batch}}} \\sum_{m=1}^{N_{\\text{batch}}} \\log \\left( \\frac{\\exp\\left(\\int_0^T V_{l(m)}^m(t) dt\\right)}{\\sum_{k=1}^{N_{\\text{out}}} \\exp\\left(\\int_0^T V_{k}^m(t) dt\\right)} \\right)
@@ -374,11 +415,11 @@ class EventPropCompiler(Compiler):
                                     spikes used for regularisation
         max_spikes:                 What is the maximum number of spikes each
                                     neuron (input and hidden) can emit each
-                                    trial? This is used to allocate memory 
+                                    trial? This is used to allocate memory
                                     for the backward pass.
         strict_buffer_checking:     For performance reasons, if neurons emit
                                     more than ``max_spikes`` they are normally
-                                    ignored but, if this flag is set, 
+                                    ignored but, if this flag is set,
                                     this will cause an error.
         per_timestep_loss:          Should we use the per-timestep or
                                     per-trial loss functions described above?
@@ -388,39 +429,55 @@ class EventPropCompiler(Compiler):
                                     best with modest batch sizes (32-128)
         rng_seed:                   What value should GeNN's GPU RNG be seeded
                                     with? This is used for all GPU randomness
-                                    e.g. weight initialisation and Poisson 
+                                    e.g. weight initialisation and Poisson
                                     spike train generation
         kernel_profiling:           Should GeNN record the time spent in each
                                     GPU kernel? These values can be extracted
-                                    directly from the GeNN model which can be 
+                                    directly from the GeNN model which can be
                                     accessed via the ``genn_model`` property
                                     of the compiled model.
         reset_time_between_batches: Should time be reset to zero at the start
                                     of each example or allowed to run
-                                    continously? 
+                                    continously?
         communicator:               Communicator used for inter-process
                                     communications when training across
                                     multiple GPUs.
-        
+
     """
 
-    def __init__(self, example_timesteps: int, losses, optimiser="adam",
-                 reg_lambda_upper: float = 0.0, reg_lambda_lower: float = 0.0,
-                 reg_nu_upper: float = 0.0, max_spikes: int = 500,
-                 strict_buffer_checking: bool = False,
-                 per_timestep_loss: bool = False, dt: float = 1.0,
-                 batch_size: int = 1, rng_seed: int = 0,
-                 kernel_profiling: bool = False,
-                 communicator: Communicator = None, **genn_kwargs):
-        supported_matrix_types = [SynapseMatrixType.TOEPLITZ,
-                                  SynapseMatrixType.PROCEDURAL_KERNELG,
-                                  SynapseMatrixType.DENSE,
-                                  SynapseMatrixType.SPARSE]
-        super(EventPropCompiler, self).__init__(supported_matrix_types, dt,
-                                                batch_size, rng_seed,
-                                                kernel_profiling,
-                                                communicator,
-                                                **genn_kwargs)
+    def __init__(
+        self,
+        example_timesteps: int,
+        losses,
+        optimiser="adam",
+        reg_lambda_upper: float = 0.0,
+        reg_lambda_lower: float = 0.0,
+        reg_nu_upper: float = 0.0,
+        max_spikes: int = 500,
+        strict_buffer_checking: bool = False,
+        per_timestep_loss: bool = False,
+        dt: float = 1.0,
+        batch_size: int = 1,
+        rng_seed: int = 0,
+        kernel_profiling: bool = False,
+        communicator: Communicator = None,
+        **genn_kwargs,
+    ):
+        supported_matrix_types = [
+            SynapseMatrixType.TOEPLITZ,
+            SynapseMatrixType.PROCEDURAL_KERNELG,
+            SynapseMatrixType.DENSE,
+            SynapseMatrixType.SPARSE,
+        ]
+        super(EventPropCompiler, self).__init__(
+            supported_matrix_types,
+            dt,
+            batch_size,
+            rng_seed,
+            kernel_profiling,
+            communicator,
+            **genn_kwargs,
+        )
         self.example_timesteps = example_timesteps
         self.losses = losses
         self.reg_lambda_upper = reg_lambda_upper
@@ -429,20 +486,19 @@ class EventPropCompiler(Compiler):
         self.max_spikes = max_spikes
         self.strict_buffer_checking = strict_buffer_checking
         self.per_timestep_loss = per_timestep_loss
-        self._optimiser = get_object(optimiser, Optimiser, "Optimiser",
-                                     default_optimisers)
+        self._optimiser = get_object(
+            optimiser, Optimiser, "Optimiser", default_optimisers
+        )
 
-    def pre_compile(self, network: Network, 
-                    genn_model, **kwargs) -> CompileState:
+    def pre_compile(self, network: Network, genn_model, **kwargs) -> CompileState:
         # Build list of output populations
-        readouts = [p for p in network.populations
-                    if p.neuron.readout is not None]
+        readouts = [p for p in network.populations if p.neuron.readout is not None]
 
-        return CompileState(self.losses, readouts,
-                            genn_model.backend_name)
+        return CompileState(self.losses, readouts, genn_model.backend_name)
 
-    def build_neuron_model(self, pop: Population, model: NeuronModel,
-                           compile_state: CompileState) -> NeuronModel:
+    def build_neuron_model(
+        self, pop: Population, model: NeuronModel, compile_state: CompileState
+    ) -> NeuronModel:
         # Make copy of model
         model_copy = deepcopy(model)
 
@@ -452,33 +508,46 @@ class EventPropCompiler(Compiler):
             mse_loss = isinstance(compile_state.losses[pop], MeanSquareError)
             # Check loss function is compatible
             # **TODO** categorical crossentropy i.e. one-hot encoded
-            if not (sce_loss or mse_loss):
+
+            loss = compile_state.losses[pop]
+            loss_type = type(loss)
+            if not isinstance(
+                loss,
+                (SparseCategoricalCrossentropy, ManualGradient),
+            ):
                 raise NotImplementedError(
-                    f"EventProp compiler doesn't support "
-                    f"{type(loss).__name__} loss")
+                    f"EventProp compiler doesn't support " f"{loss_type.__name__} loss"
+                )
+
+            sce_loss, mg_loss = [
+                loss_type is t for t in (SparseCategoricalCrossentropy, ManualGradient)
+            ]
 
             # Add output logic to model
             model_copy = pop.neuron.readout.add_readout_logic(
-                model_copy, max_time_required=True, dt=self.dt,
-                example_timesteps=self.example_timesteps)
 
-            # **HACK** we don't want to call add_to_neuron on loss function as
-            # it will add unwanted code to end of neuron but we do want this
+                model_copy,
+                max_time_required=True,
+                dt=self.dt,
+                example_timesteps=self.example_timesteps,
+                batch_size=self.batch_size,
+                pop_shape=pop.shape,
+            )
+
             if sce_loss:
+
                 # Add variable, shared across neurons to hold true label for batch
-                model_copy.add_var("YTrue", "uint8_t", 0, 
-                                   VarAccess.READ_ONLY_SHARED_NEURON)
+                # **HACK** we don't want to call add_to_neuron on loss function as
+                # it will add unwanted code to end of neuron but we do want this
+                model_copy.add_var(
+                    "YTrue", "uint8_t", 0, VarAccess.READ_ONLY_SHARED_NEURON
+                )
 
                 # Add second variable to hold the true label for the backward pass
-                model_copy.add_var("YTrueBack", "uint8_t", 0, 
-                                   VarAccess.READ_ONLY_SHARED_NEURON)
-            elif mse_loss:
-                # The true label is the desired voltage output over time
-                flat_shape = np.prod(pop.shape)
-                egp_size = (self.example_timesteps * self.batch_size * flat_shape)
-                model_copy.add_egp("YTrue", "scalar*",
-                              np.empty(egp_size, dtype=np.float32))
-                
+                model_copy.add_var(
+                    "YTrueBack", "uint8_t", 0, VarAccess.READ_ONLY_SHARED_NEURON
+                )
+
             # If neuron model is a leaky integrator
             if isinstance(pop.neuron, LeakyIntegrate):
                 # Get tau_syn from population's incoming connections
@@ -494,10 +563,9 @@ class EventPropCompiler(Compiler):
                 # Add parameter for scaling factor
                 tau_mem = pop.neuron.tau_mem
                 model_copy.add_param("TauM", "scalar", tau_mem)
-                model_copy.add_param("A", "scalar", 
-                                     tau_mem / (tau_mem - tau_syn))
+                model_copy.add_param("A", "scalar", tau_mem / (tau_mem - tau_syn))
 
-                # Add dynamic parameter to contain trial index and add 
+                # Add dynamic parameter to contain trial index and add
                 # population to list of those which require it updating
                 model_copy.add_param("Trial", "unsigned int", 0)
                 model_copy.set_param_dynamic("Trial")
@@ -508,166 +576,238 @@ class EventPropCompiler(Compiler):
                     f"""
                     LambdaI = drive + ((LambdaI - drive) * Beta) + (A * (LambdaV - drive) * (Alpha - Beta));
                     LambdaV = drive + ((LambdaV - drive) * Alpha);
-                    """)
+                    """
+                )
 
-                # If we want to calculate mean-squared error or per-timestep loss
-                if self.per_timestep_loss or mse_loss:
+
+                # If we want to calculate per-timestep loss
+                if self.per_timestep_loss or mg_loss:
                     # Get reset vars before we add ring-buffer variables
                     reset_vars = model_copy.reset_vars
 
-                    # Add variables to hold offsets for 
+                    # Add variables to hold offsets for
                     # reading and writing ring variables
                     model_copy.add_var("RingWriteOffset", "int", 0)
                     model_copy.add_var("RingReadOffset", "int", 0)
 
-                    # Add EGP for softmax V (SCE) or regression difference (MSE) ring variable
-                    ring_size = self.batch_size * np.prod(pop.shape) * 2 * self.example_timesteps
-                    model_copy.add_egp("RingOutputLossTerm", "scalar*", 
-                                       np.empty(ring_size, dtype=np.float32))
-
                     if sce_loss:
-                        # If readout is AvgVar or SumVar
+                        # Add EGP for softmax V ring variable
+                        ring_size = (
+                            self.batch_size
+                            * np.prod(pop.shape)
+                            * 2
+                            * self.example_timesteps
+                        )
+                        model_copy.add_egp(
+                            "RingSoftmaxV",
+                            "scalar*",
+                            np.empty(ring_size, dtype=np.float32),
+                        )
+                    else:
+                        # Add EGP for V ring variable
+                        # here we only need to store V
+                        # "once" in the batch, because
+                        # the gradient data will be stored in
+                        # a separate buffer
+                        ring_size = (
+                            self.batch_size
+                            * np.prod(pop.shape)
+                            * self.example_timesteps
+                        )
+
+                        # **NOTE** the ring buffer for the voltage should already be added by the readout
+                        # model_copy.add_egp(
+                        #    "RingV",
+                        #    "scalar*",
+                        #    np.empty(ring_size, dtype=np.float32),
+                        # )
+
+                        model_copy.add_egp(
+                            "Gradient",
+                            "scalar*",
+                            np.empty(ring_size, dtype=np.float32),
+                        )
+
+                    # If readout is AvgVar or SumVar
+                    if sce_loss:
                         if isinstance(pop.neuron.readout, (AvgVar, SumVar)):
                             model_copy.prepend_sim_code(
                                 f"""
                                 const int ringOffset = (batch * num_neurons * {2 * self.example_timesteps}) + (id * {2 * self.example_timesteps});
                                 if (Trial > 0) {{
                                     RingReadOffset--;
-                                    const scalar softmax = RingOutputLossTerm[ringOffset + RingReadOffset];
+
+                                    const scalar softmax = RingSoftmaxV[ringOffset + RingReadOffset];
                                     const scalar g = (id == YTrueBack) ? (1.0 - softmax) : -softmax;
                                     drive = g / (TauM * num_batch * {self.dt * self.example_timesteps});
                                 }}
-                                
-                                // Forward pass
-                                """)
 
-                            # Add custom updates to calculate 
+                                // Forward pass
+                                """
+                            )
+
+                            # Add custom updates to calculate
                             # softmax from V and write directly to buffermodel_copy
                             compile_state.timestep_softmax_populations.append(
-                                (pop, "V"))
-                            # Add custom update to reset state
-                            compile_state.add_neuron_reset_vars(
-                                pop, reset_vars, False, True)
-                            
-                        # Otherwise, unsupported readout type
-                        else:
-                            raise NotImplementedError(
-                                f"EventProp compiler with CategoricalCrossEntropy loss doesn't support "
-                                f"{type(pop.neuron.readout).__name__} readouts")
-                    elif mse_loss:
-                        # Readout has to be Var
-                        if isinstance(pop.neuron.readout, Var):
-                            model_copy.prepend_sim_code(
-                                f"""
-                                const int ringOffset = (batch * num_neurons * {2 * self.example_timesteps}) + (id * {2 * self.example_timesteps});
-                                if (Trial > 0) {{
-                                    RingReadOffset--;
-                                    const scalar error = RingOutputLossTerm[ringOffset + RingReadOffset];
-                                    drive = error / (TauM * num_batch * {self.dt * self.example_timesteps});
-                                }}
-                                """)
-                            # Add custom update to reset state JAMIE_CHECK
-                            compile_state.add_neuron_reset_vars(
-                                pop, reset_vars, False, True)
-                            # Add code to fill errors into RingBuffer
-                            model_copy.append_sim_code(
-                                f"""
-                                const unsigned int timestep = (int)round(t / dt);
-                                const unsigned int index = (batch * {self.example_timesteps} * num_neurons)
-                                       + (timestep * num_neurons) + id;
-                                RingOutputLossTerm[ringOffset + RingWriteOffset] = YTrue[index] - V;
-                                RingWriteOffset++;
-                                """)
-                        # Otherwise, unsupported readout type
-                        else:
-                           raise NotImplementedError(
-                                f"EventProp compiler with MeanSqareError loss only supports "
-                                f"'Var' readouts") 
-                # Otherwise, we want to calculate loss over each trial
-                else:
-                    if sce_loss:
-                        # Add state variable to hold softmax of output
-                        model_copy.add_var("Softmax", "scalar", 0.0,
-                                           VarAccess.READ_ONLY_DUPLICATE)
-
-                        # If readout is AvgVar or SumVar
-                        if isinstance(pop.neuron.readout, (AvgVar, SumVar)):
-                            model_copy.prepend_sim_code(
-                                f"""
-                                if (Trial > 0) {{
-                                    const scalar g = (id == YTrueBack) ? (1.0 - Softmax) : -Softmax;
-                                    drive = g / (TauM * num_batch * {self.dt * self.example_timesteps});
-                                }}
-
-                                // Forward pass
-                                """)
-
-                            # Add custom updates to calculate 
-                            # softmax from VSum or VAvg
-                            var = ("VSum" if isinstance(pop.neuron.readout, SumVar)
-                                   else "VAvg")
-                            compile_state.batch_softmax_populations.append(
-                                (pop, var, "Softmax"))
+                                (pop, "V")
+                            )
 
                             # Add custom update to reset state
                             compile_state.add_neuron_reset_vars(
-                                pop, model_copy.reset_vars, False, False)
-                        # Otherwise, if readout is AvgVarExpWeight
-                        elif isinstance(pop.neuron.readout, AvgVarExpWeight):
-                            local_t_scale = 1.0 / (self.dt * self.example_timesteps)
-                            model_copy.prepend_sim_code(
-                                f"""
-                                if (Trial > 0) {{
-                                    const scalar g = (id == YTrueBack) ? (1.0 - Softmax) : -Softmax;
-                                    drive = (g * exp(-(1.0 - (t * {local_t_scale})))) / (TauM * num_batch * {self.dt * self.example_timesteps});
-                                }}
+                                pop, reset_vars, False, True
+                            )
 
-                                // Forward pass
-                                """)
-
-                            # Add custom updates to calculate softmax from VAvg
-                            compile_state.batch_softmax_populations.append(
-                                (pop, "VAvg", "Softmax"))
-
-                            # Add custom update to reset state
-                            compile_state.add_neuron_reset_vars(
-                                pop, model_copy.reset_vars, False, False)
-                        # Otherwise, if readout is MaxVar
-                        elif isinstance(pop.neuron.readout, MaxVar):
-                            # Add state variable to hold vmax from previous trial
-                            model_copy.add_var("VMaxTimeBack", "scalar", 0.0,
-                                               VarAccess.READ_ONLY_DUPLICATE)
-
-                            model_copy.prepend_sim_code(
-                                f"""
-                                if (Trial > 0 && fabs(backT - VMaxTimeBack) < 1e-3*dt) {{
-                                    const scalar g = (id == YTrueBack) ? (1.0 - Softmax) : -Softmax;
-                                    drive = g / (TauM * num_batch * {self.dt * self.example_timesteps});
-                                }}
-
-                                // Forward pass
-                                """)
-
-                            # Add custom updates to calculate softmax from VMax
-                            compile_state.batch_softmax_populations.append(
-                                (pop, "VMax", "Softmax"))
-
-                            # Add custom update to reset state
-                            # **NOTE** reset VMaxTimeBack first so VMaxTime isn't zeroed
-                            # **TODO** time type
-                            compile_state.add_neuron_reset_vars(
-                                pop, 
-                                [("VMaxTimeBack", "scalar", "VMaxTime")] + model_copy.reset_vars, 
-                                False, False)
-                        # Otherwise, unsupported readout type
                         else:
                             raise NotImplementedError(
                                 f"EventProp compiler doesn't support "
-                                f"{type(pop.neuron.readout).__name__} readouts")
-                    elif mse_loss:
+                                f"{type(pop.neuron.readout).__name__} readouts"
+                            )
+
+                    elif mg_loss:
+                        # **NOTE** I am not really sure what the AvgVar and SumVar means with respect to the EventProp loss:
+                        # the loss is a function of all the spike times and the trajectory of the membrane potentials over the trial.
+                        # This means it COULD be a function of the average or "sum" (Integral?) of the membrane potential over time,
+                        # or a temporal average/sum of a function of the membrane potential, but it does not have to be, technically.
+                        # Is it possible that this is just to check if any readout mode OTHER than AvgVar or SumVar
+                        # such as "spike_count" is used (which would definitely make no sense in the context of EventProp, because the gradients
+                        # of the spike count with respect to spike times or voltages would be zero)?
+                        if isinstance(pop.neuron.readout, VarTrial):
+                            model_copy.prepend_sim_code(
+                                f"""
+                                const unsigned int timestep = min((int)(t / dt), {self.example_timesteps - 1});
+                                // **NOTE** The ordering of the indices might be wrong.
+                                // index for reversed time.
+                                unsigned int index = batch * {self.example_timesteps} * num_neurons + (({self.example_timesteps} - 1 - timestep) * num_neurons) + id;
+
+                                if (Trial > 0) {{
+                                    const scalar grad = Gradient[index];
+                                    drive = -grad;
+                                    // why is drive being scaled? I think in the manual case, this is not necessary.
+                                    //drive = -grad / (TauM * num_batch * {self.dt * self.example_timesteps});
+                                }}
+                                """
+                            )
+                            # I just copied this from Thomas' code for the mse loss, so I am not sure if this is correct
+                            compile_state.add_neuron_reset_vars(
+                                pop, reset_vars, False, True
+                            )
+
+                            # **NOTE** The code for storing the voltages should have been added by the readout
+                            # model_copy.append_sim_code(
+                            #    """
+                            #    // index for forward time.
+                            #    // **NOTE** The ordering of the indices might be wrong.
+                            #    index = (timestep * num_batch * num_neurons) + (batch * num_neurons) + id;
+                            #    RingV[index] = V;
+                            #    """
+                            # )
+                        else:
+                            raise NotImplementedError(
+                                "EventProp compiler with SetTargetGeneric loss only supports "
+                                "'VarTrial' readouts"
+                            )
+
+                    # Otherwise, unsupported readout type
+                    # Otherwise, we want to calculate loss over each trial
+                else:
+                    if mg_loss:
+                        raise NotImplementedError(
+                            "EventProp compiler doesn't support "
+                            "time average loss for manual gradient loss"
+                        )
+                    # Add state variable to hold softmax of output
+                    model_copy.add_var(
+                        "Softmax", "scalar", 0.0, VarAccess.READ_ONLY_DUPLICATE
+                    )
+
+                    # If readout is AvgVar or SumVar
+                    if isinstance(pop.neuron.readout, (AvgVar, SumVar)):
+                        model_copy.prepend_sim_code(
+                            f"""
+                            if (Trial > 0) {{
+                                const scalar g = (id == YTrueBack) ? (1.0 - Softmax) : -Softmax;
+                                drive = g / (TauM * num_batch * {self.dt * self.example_timesteps});
+                            }}
+
+                            // Forward pass
+                            """
+                        )
+
+                        # Add custom updates to calculate
+                        # softmax from VSum or VAvg
+                        var = (
+                            "VSum" if isinstance(pop.neuron.readout, SumVar) else "VAvg"
+                        )
+                        compile_state.batch_softmax_populations.append(
+                            (pop, var, "Softmax")
+                        )
+
+                        # Add custom update to reset state
+                        compile_state.add_neuron_reset_vars(
+                            pop, model_copy.reset_vars, False, False
+                        )
+                    # Otherwise, if readout is AvgVarExpWeight
+                    elif isinstance(pop.neuron.readout, AvgVarExpWeight):
+                        local_t_scale = 1.0 / (self.dt * self.example_timesteps)
+                        model_copy.prepend_sim_code(
+                            f"""
+                            if (Trial > 0) {{
+                                const scalar g = (id == YTrueBack) ? (1.0 - Softmax) : -Softmax;
+                                drive = (g * exp(-(1.0 - (t * {local_t_scale})))) / (TauM * num_batch * {self.dt * self.example_timesteps});
+                            }}
+
+                            // Forward pass
+                            """
+                        )
+
+                        # Add custom updates to calculate softmax from VAvg
+                        compile_state.batch_softmax_populations.append(
+                            (pop, "VAvg", "Softmax")
+                        )
+
+                        # Add custom update to reset state
+                        compile_state.add_neuron_reset_vars(
+                            pop, model_copy.reset_vars, False, False
+                        )
+                    # Otherwise, if readout is MaxVar
+                    elif isinstance(pop.neuron.readout, MaxVar):
+                        # Add state variable to hold vmax from previous trial
+                        model_copy.add_var(
+                            "VMaxTimeBack", "scalar", 0.0, VarAccess.READ_ONLY_DUPLICATE
+                        )
+
+                        model_copy.prepend_sim_code(
+                            f"""
+                            if (Trial > 0 && fabs(backT - VMaxTimeBack) < 1e-3*DT) {{
+                                const scalar g = (id == YTrueBack) ? (1.0 - Softmax) : -Softmax;
+                                drive = g / (TauM * num_batch * {self.dt * self.example_timesteps});
+                            }}
+
+                            // Forward pass
+                            """
+                        )
+
+                        # Add custom updates to calculate softmax from VMax
+                        compile_state.batch_softmax_populations.append(
+                            (pop, "VMax", "Softmax")
+                        )
+
+                        # Add custom update to reset state
+                        # **NOTE** reset VMaxTimeBack first so VMaxTime isn't zeroed
+                        # **TODO** time type
+                        compile_state.add_neuron_reset_vars(
+                            pop,
+                            [("VMaxTimeBack", "scalar", "VMaxTime")]
+                            + model_copy.reset_vars,
+                            False,
+                            False,
+                        )
+                    # Otherwise, unsupported readout type
+                    else:
                         raise NotImplementedError(
                             f"EventProp compiler doesn't support "
-                            f"time averaged loss for regression.")
+                            f"{type(pop.neuron.readout).__name__} readouts"
+                        )
                 # Prepend standard code to update LambdaV and LambdaI
                 model_copy.prepend_sim_code(
                     f"""
@@ -675,23 +815,26 @@ class EventPropCompiler(Compiler):
 
                     // Backward pass
                     scalar drive = 0.0;
-                    """)
+                    """
+                )
 
                 # Add second reset custom update to reset YTrueBack to YTrue
                 # **NOTE** seperate as these are SHARED_NEURON variables
                 if sce_loss:
                     compile_state.add_neuron_reset_vars(
-                        pop, [("YTrueBack", "uint8_t", "YTrue")], False, False)
+                        pop, [("YTrueBack", "uint8_t", "YTrue")], False, False
+                    )
             # Otherwise, neuron type is unsupported
             else:
                 raise NotImplementedError(
                     f"EventProp compiler doesn't support "
-                    f"{type(pop.neuron).__name__} neurons")
+                    f"{type(pop.neuron).__name__} neurons"
+                )
 
         # Otherwise, it's either an input or a hidden neuron
         # i.e. it requires a ring-buffer
         else:
-            # Add variables to hold offsets for 
+            # Add variables to hold offsets for
             # reading and writing ring variables
             model_copy.add_var("RingWriteOffset", "int", 0)
             model_copy.add_var("RingReadOffset", "int", self.max_spikes - 1)
@@ -699,43 +842,47 @@ class EventPropCompiler(Compiler):
             # Add variables to hold offsets where this neuron
             # started writing to ring during the forward
             # pass and where data to read during backward pass ends
-            model_copy.add_var("RingWriteStartOffset", "int",
-                               self.max_spikes - 1)
-            model_copy.add_var("RingReadEndOffset", "int", 
-                               self.max_spikes - 1)
+            model_copy.add_var("RingWriteStartOffset", "int", self.max_spikes - 1)
+            model_copy.add_var("RingReadEndOffset", "int", self.max_spikes - 1)
 
             # Add variable to hold backspike flag
             model_copy.add_var("BackSpike", "uint8_t", False)
 
             # Add EGP for spike time ring variables
             ring_size = self.batch_size * np.prod(pop.shape) * self.max_spikes
-            model_copy.add_egp("RingSpikeTime", "scalar*", 
-                               np.empty(ring_size, dtype=np.float32))
+            model_copy.add_egp(
+                "RingSpikeTime", "scalar*", np.empty(ring_size, dtype=np.float32)
+            )
 
             # If neuron is an input
             if isinstance(pop.neuron, Input):
-                # Add reset logic to reset any state 
+                # Add reset logic to reset any state
                 # variables from the original model
-                compile_state.add_neuron_reset_vars(pop, model.reset_vars,
-                                                    True, False)
+                compile_state.add_neuron_reset_vars(pop, model.reset_vars, True, False)
 
-                # Add code to start of sim code to run 
+                # Add code to start of sim code to run
                 # backwards pass and handle back spikes
                 model_copy.prepend_sim_code(
                     neuron_backward_pass.substitute(
                         max_spikes=self.max_spikes,
                         example_time=(self.example_timesteps * self.dt),
                         dynamics="",
-                        transition=""))
+                        transition="",
+                    )
+                )
 
                 # Prepend code to reset to write spike time to ring buffer
                 model_copy.prepend_reset_code(
                     neuron_reset.substitute(
                         max_spikes=self.max_spikes,
                         write="",
-                        strict_check=(neuron_reset_strict_check
-                                      if self.strict_buffer_checking
-                                      else "")))
+                        strict_check=(
+                            neuron_reset_strict_check
+                            if self.strict_buffer_checking
+                            else ""
+                        ),
+                    )
+                )
             # Otherwise i.e. it's hidden
             else:
                 # Add additional input variable to receive feedback
@@ -745,68 +892,80 @@ class EventPropCompiler(Compiler):
                 if isinstance(pop.neuron, LeakyIntegrateFire):
                     # Check EventProp constraints
                     if pop.neuron.integrate_during_refrac:
-                        logger.warning("EventProp learning works best with "
-                                       "LIF neurons which do not continue to "
-                                       "integrate in their refractory period")
+                        logger.warning(
+                            "EventProp learning works best with "
+                            "LIF neurons which do not continue to "
+                            "integrate in their refractory period"
+                        )
                     if pop.neuron.relative_reset:
-                        logger.warning("EventProp learning works best "
-                                       "with LIF neurons with an "
-                                       "absolute reset mechanism")
+                        logger.warning(
+                            "EventProp learning works best "
+                            "with LIF neurons with an "
+                            "absolute reset mechanism"
+                        )
 
                     # Get tau_syn from population's incoming connections
                     tau_syn = _get_tau_syn(pop)
 
                     # Add parameter with synaptic decay constant
-                    model_copy.add_param("Beta", "scalar",
-                                         np.exp(-self.dt / tau_syn))
+                    model_copy.add_param("Beta", "scalar", np.exp(-self.dt / tau_syn))
 
                     # Add adjoint state variables
                     model_copy.add_var("LambdaV", "scalar", 0.0)
                     model_copy.add_var("LambdaI", "scalar", 0.0)
 
                     # Add EGP for IMinusV ring variables
-                    model_copy.add_egp("RingIMinusV", "scalar*", 
-                                       np.empty(ring_size, dtype=np.float32))
+                    model_copy.add_egp(
+                        "RingIMinusV", "scalar*", np.empty(ring_size, dtype=np.float32)
+                    )
 
                     # Add parameter for scaling factor
                     tau_mem = pop.neuron.tau_mem
-                    model_copy.add_param("A", "scalar", 
-                                         tau_mem / (tau_syn - tau_mem))
+                    model_copy.add_param("A", "scalar", tau_mem / (tau_syn - tau_mem))
 
                     # On backward pass transition, update LambdaV
                     transition_code = """
                         LambdaV += (1.0 / RingIMinusV[ringOffset + RingReadOffset]) * (Vthresh * LambdaV + RevISyn);
                         """
 
-                    # List of variables aside from those in base 
+                    # List of variables aside from those in base
                     # model we want to reset every batch
-                    additional_reset_vars = [("LambdaV", "scalar", 0.0),
-                                             ("LambdaI", "scalar", 0.0)]
+                    additional_reset_vars = [
+                        ("LambdaV", "scalar", 0.0),
+                        ("LambdaI", "scalar", 0.0),
+                    ]
 
                     # If regularisation is enabled
                     # **THINK** is this LIF-specific?
                     if self.regulariser_enabled:
-                        # Add state variables to hold spike count 
+                        # Add state variables to hold spike count
                         # during forward and backward pass
                         model_copy.add_var("SpikeCount", "int", 0)
-                        model_copy.add_var("SpikeCountBack", "int", 0,
-                                           VarAccess.READ_ONLY_DUPLICATE)
+                        model_copy.add_var(
+                            "SpikeCountBack", "int", 0, VarAccess.READ_ONLY_DUPLICATE
+                        )
 
                         # Add parameters for regulariser
-                        model_copy.add_param("RegNuUpper", "int",
-                                             self.reg_nu_upper)
+                        model_copy.add_param("RegNuUpper", "int", self.reg_nu_upper)
                         model_copy.add_param(
-                            "RegLambdaUpper", "scalar",
-                            self.reg_lambda_upper / self.full_batch_size)
+                            "RegLambdaUpper",
+                            "scalar",
+                            self.reg_lambda_upper / self.full_batch_size,
+                        )
                         model_copy.add_param(
-                            "RegLambdaLower", "scalar",
-                            self.reg_lambda_lower / self.full_batch_size)
+                            "RegLambdaLower",
+                            "scalar",
+                            self.reg_lambda_lower / self.full_batch_size,
+                        )
 
                         # Add reset variables to copy SpikeCount
                         # into SpikeCountBack and zero SpikeCount
                         additional_reset_vars.extend(
-                            [("SpikeCountBack", "int", "SpikeCount"),
-                             ("SpikeCount", "int", 0)])
+                            [
+                                ("SpikeCountBack", "int", "SpikeCount"),
+                                ("SpikeCount", "int", 0),
+                            ]
+                        )
 
                         # Add additional transition code to apply regularisation
                         transition_code += """
@@ -821,13 +980,13 @@ class EventPropCompiler(Compiler):
                         # Add code to update SpikeCount in forward reset code
                         model_copy.append_reset_code("SpikeCount++;")
 
-                    # Add reset logic to reset adjoint state variables 
+                    # Add reset logic to reset adjoint state variables
                     # as well as any state variables from the original model
                     compile_state.add_neuron_reset_vars(
-                        pop, model.reset_vars + additional_reset_vars,
-                        True, False)
+                        pop, model.reset_vars + additional_reset_vars, True, False
+                    )
 
-                    # Add code to start of sim code to run backwards pass 
+                    # Add code to start of sim code to run backwards pass
                     # and handle back spikes with correct LIF dynamics
                     model_copy.prepend_sim_code(
                         neuron_backward_pass.substitute(
@@ -837,53 +996,68 @@ class EventPropCompiler(Compiler):
                             LambdaI = (A * LambdaV * (Beta - Alpha)) + (LambdaI * Beta);
                             LambdaV *= Alpha;
                             """,
-                            transition=transition_code))
+                            transition=transition_code,
+                        )
+                    )
 
-                    # Prepend (as it accesses the pre-reset value of V) 
+                    # Prepend (as it accesses the pre-reset value of V)
                     # code to reset to write spike time and I-V to ring buffer
                     model_copy.prepend_reset_code(
                         neuron_reset.substitute(
                             max_spikes=self.max_spikes,
                             write="RingIMinusV[ringOffset + RingWriteOffset] = Isyn - V;",
-                            strict_check=(neuron_reset_strict_check 
-                                          if self.strict_buffer_checking
-                                          else "")))
+                            strict_check=(
+                                neuron_reset_strict_check
+                                if self.strict_buffer_checking
+                                else ""
+                            ),
+                        )
+                    )
                 # Otherwise, neuron type is unsupported
                 else:
                     raise NotImplementedError(
                         f"EventProp compiler doesn't support "
-                        f"{type(pop.neuron).__name__} neurons")
+                        f"{type(pop.neuron).__name__} neurons"
+                    )
 
         # Build neuron model and return
         return model_copy
 
-    def build_synapse_model(self, conn: Connection, model: SynapseModel,
-                            compile_state: CompileState) -> SynapseModel:
-        # **NOTE** this is probably not necessary as 
+    def build_synapse_model(
+        self, conn: Connection, model: SynapseModel, compile_state: CompileState
+    ) -> SynapseModel:
+        # **NOTE** this is probably not necessary as
         # it's also checked in build_neuron_model
         if not isinstance(conn.synapse, Exponential):
-            raise NotImplementedError("EventProp compiler only "
-                                      "supports Exponential synapses")
+            raise NotImplementedError(
+                "EventProp compiler only " "supports Exponential synapses"
+            )
 
         # Return model
         return model
 
-    def build_weight_update_model(self, conn: Connection,
-                                  connect_snippet: ConnectivitySnippet,
-                                  compile_state: CompileState) -> WeightUpdateModel:
+    def build_weight_update_model(
+        self,
+        conn: Connection,
+        connect_snippet: ConnectivitySnippet,
+        compile_state: CompileState,
+    ) -> WeightUpdateModel:
         if not is_value_constant(connect_snippet.delay):
-            raise NotImplementedError("EventProp compiler only "
-                                      "support heterogeneous delays")
+            raise NotImplementedError(
+                "EventProp compiler only " "support heterogeneous delays"
+            )
 
         # If this is some form of trainable connectivity
         if connect_snippet.trainable:
-            # **NOTE** this is probably not necessary as 
+            # **NOTE** this is probably not necessary as
             # it's also checked in build_neuron_model
             if isinstance(conn.synapse, Exponential):
                 tau_syn = conn.synapse.tau
             else:
-                raise NotImplementedError("EventProp compiler only "
-                                          "supports Exponential synapses")
+                raise NotImplementedError(
+                    "EventProp compiler only " "supports Exponential synapses"
+                )
+
 
             # Determine whether kernel updates are required
             use_kernel = (
@@ -896,7 +1070,8 @@ class EventPropCompiler(Compiler):
                 param_vals={"TauSyn": tau_syn},
                 var_vals={"g": connect_snippet.weight, "Gradient": 0.0},
                 pre_neuron_var_refs={"BackSpike_pre": "BackSpike"},
-                post_neuron_var_refs={"LambdaI_post": "LambdaI"})
+                post_neuron_var_refs={"LambdaI_post": "LambdaI"},
+            )
             # Add weights to list of checkpoint vars
             compile_state.checkpoint_connection_vars.append((conn, "g"))
 
@@ -907,7 +1082,8 @@ class EventPropCompiler(Compiler):
             wum = WeightUpdateModel(
                 model=deepcopy(static_weight_update_model),
                 param_vals={"g": connect_snippet.weight},
-                pre_neuron_var_refs={"BackSpike_pre": "BackSpike"})
+                pre_neuron_var_refs={"BackSpike_pre": "BackSpike"},
+            )
 
         # If source neuron isn't an input neuron
         source_neuron = conn.source().neuron
@@ -918,14 +1094,20 @@ class EventPropCompiler(Compiler):
             # If it's LIF, add additional event code to backpropagate gradient
             if isinstance(source_neuron, LeakyIntegrateFire):
                 wum.add_post_neuron_var_ref("LambdaV_post", "scalar", "LambdaV")
-                wum.append_pre_event_syn_code("addToPre(g * (LambdaV_post - LambdaI_post));")
+                wum.append_pre_event_syn_code(
+                    "addToPre(g * (LambdaV_post - LambdaI_post));"
+                )
 
         # Return weight update model
         return wum
 
-    def create_compiled_network(self, genn_model, neuron_populations: dict,
-                                connection_populations: dict, 
-                                compile_state: CompileState) -> CompiledTrainingNetwork:
+    def create_compiled_network(
+        self,
+        genn_model,
+        neuron_populations: dict,
+        connection_populations: dict,
+        compile_state: CompileState,
+    ) -> CompiledTrainingNetwork:
         # Correctly target feedback
         for c in compile_state.feedback_connections:
             connection_populations[c].pre_target_var = "RevISyn"
@@ -936,25 +1118,27 @@ class EventPropCompiler(Compiler):
             genn_pop = connection_populations[c]
             optimiser_custom_updates.append(
                 self._create_optimiser_custom_update(
-                    f"Weight{i}", create_wu_var_ref(genn_pop, "g"),
-                    create_wu_var_ref(genn_pop, "Gradient"), genn_model))
+                    f"Weight{i}",
+                    create_wu_var_ref(genn_pop, "g"),
+                    create_wu_var_ref(genn_pop, "Gradient"),
+                    genn_model,
+                )
+            )
 
         # Add per-batch softmax custom updates for each population that requires them
         for i, (p, i, o) in enumerate(compile_state.batch_softmax_populations):
             genn_pop = neuron_populations[p]
-            self.add_softmax_custom_updates(genn_model, genn_pop,
-                                            i, o, "Batch")
+            self.add_softmax_custom_updates(genn_model, genn_pop, i, o, "Batch")
 
         # Add per-timestep softmax custom updates for each population that requires them
         for i, (p, i) in enumerate(compile_state.timestep_softmax_populations):
-            # Create custom update model to implement 
+            # Create custom update model to implement
             # first softmax pass and add to model
             genn_pop = neuron_populations[p]
             self._add_softmax_buffer_custom_updates(genn_model, genn_pop, i)
 
         # Create custom updates to implement variable reset
-        compile_state.create_reset_custom_updates(self, genn_model,
-                                                  neuron_populations)
+        compile_state.create_reset_custom_updates(self, genn_model, neuron_populations)
 
         # Build list of base callbacks
         base_train_callbacks = []
@@ -962,11 +1146,11 @@ class EventPropCompiler(Compiler):
         if len(optimiser_custom_updates) > 0:
             if self.full_batch_size > 1:
                 base_train_callbacks.append(
-                    CustomUpdateOnBatchEnd("GradientBatchReduce"))
-            base_train_callbacks.append(
-                CustomUpdateOnBatchEnd("GradientLearn"))
+                    CustomUpdateOnBatchEnd("GradientBatchReduce")
+                )
+            base_train_callbacks.append(CustomUpdateOnBatchEnd("GradientLearn"))
 
-        # Add callbacks to set Trial extra global parameter 
+        # Add callbacks to set Trial extra global parameter
         # on populations which require it
         for p in compile_state.update_trial_pops:
             base_train_callbacks.append(UpdateTrial(neuron_populations[p]))
@@ -975,9 +1159,11 @@ class EventPropCompiler(Compiler):
         # **NOTE** it would be great to be able to do this on device
         for genn_syn_pop in connection_populations.values():
             base_train_callbacks.append(
-                ZeroInSynLastTimestep(genn_syn_pop, self.example_timesteps))
+                ZeroInSynLastTimestep(genn_syn_pop, self.example_timesteps)
+            )
             base_validate_callbacks.append(
-                ZeroInSynLastTimestep(genn_syn_pop, self.example_timesteps))
+                ZeroInSynLastTimestep(genn_syn_pop, self.example_timesteps)
+            )
 
         # If softmax calculation is required at end of batch, add callbacks
         if len(compile_state.batch_softmax_populations) > 0:
@@ -997,98 +1183,118 @@ class EventPropCompiler(Compiler):
             base_validate_callbacks.append(CustomUpdateOnBatchBegin("Reset"))
 
         return CompiledTrainingNetwork(
-            genn_model, neuron_populations, connection_populations,
-            self.communicator, compile_state.losses, self._optimiser,
-            self.example_timesteps, base_train_callbacks,
-            base_validate_callbacks, optimiser_custom_updates,
+            genn_model,
+            neuron_populations,
+            connection_populations,
+            self.communicator,
+            compile_state.losses,
+            self._optimiser,
+            self.example_timesteps,
+            base_train_callbacks,
+            base_validate_callbacks,
+            optimiser_custom_updates,
             compile_state.checkpoint_connection_vars,
-            compile_state.checkpoint_population_vars, True)
+            compile_state.checkpoint_population_vars,
+            True,
+        )
 
     @property
     def regulariser_enabled(self):
-        return (self.reg_lambda_lower != 0.0 
-                or self.reg_lambda_upper != 0.0)
+        return self.reg_lambda_lower != 0.0 or self.reg_lambda_upper != 0.0
 
-    def _add_softmax_buffer_custom_updates(self, genn_model, genn_pop, 
-                                           input_var_name: str):
-        # Create custom update model to implement 
+    def _add_softmax_buffer_custom_updates(
+        self, genn_model, genn_pop, input_var_name: str
+    ):
+        # Create custom update model to implement
         # first softmax pass and add to model
         softmax_1 = CustomUpdateModel(
-            softmax_1_model, {}, {"MaxVal": 0.0},
-            {"Val": create_var_ref(genn_pop, input_var_name)})
+            softmax_1_model,
+            {},
+            {"MaxVal": 0.0},
+            {"Val": create_var_ref(genn_pop, input_var_name)},
+        )
 
         genn_softmax_1 = self.add_custom_update(
-            genn_model, softmax_1, 
-            "Softmax1",
-            "CUSoftmax1" + genn_pop.name)
+            genn_model, softmax_1, "Softmax1", "CUSoftmax1" + genn_pop.name
+        )
 
-        # Create custom update model to implement 
+        # Create custom update model to implement
         # second softmax pass and add to model
         softmax_2 = CustomUpdateModel(
-            softmax_2_model, {}, {"SumExpVal": 0.0},
-            {"Val": create_var_ref(genn_pop, input_var_name),
-             "MaxVal": create_var_ref(genn_softmax_1, "MaxVal")})
+            softmax_2_model,
+            {},
+            {"SumExpVal": 0.0},
+            {
+                "Val": create_var_ref(genn_pop, input_var_name),
+                "MaxVal": create_var_ref(genn_softmax_1, "MaxVal"),
+            },
+        )
 
         genn_softmax_2 = self.add_custom_update(
-            genn_model, softmax_2, 
-            "Softmax2",
-            "CUSoftmax2" + genn_pop.name)
+            genn_model, softmax_2, "Softmax2", "CUSoftmax2" + genn_pop.name
+        )
 
-        # Create custom update model to implement 
+        # Create custom update model to implement
         # third softmax pass and add to model
         softmax_3 = CustomUpdateModel(
             {
+
                 "var_refs": [("Val", "scalar", VarAccessMode.READ_ONLY),
                              ("MaxVal", "scalar", VarAccessMode.READ_ONLY),
                              ("SumExpVal", "scalar", VarAccessMode.READ_ONLY),
                              ("RingWriteOffset", "int")],
                 "extra_global_param_refs": [("RingOutputLossTerm", "scalar*")],
+
                 "update_code": f"""
                 const int ringOffset = (batch * num_neurons * {2 * self.example_timesteps}) + (id * {2 * self.example_timesteps});
                 RingOutputLossTerm[ringOffset + RingWriteOffset]= exp(Val - MaxVal) / SumExpVal;
                 RingWriteOffset++;
-                """}, 
-            {}, {},
-            {"Val": create_var_ref(genn_pop, input_var_name),
-             "MaxVal": create_var_ref(genn_softmax_1, "MaxVal"),
-             "SumExpVal": create_var_ref(genn_softmax_2, "SumExpVal"),
-             "RingWriteOffset": create_var_ref(genn_pop, "RingWriteOffset")},
+                """,
+            },
             {},
             {"RingOutputLossTerm": create_egp_ref(genn_pop, "RingOutputLossTerm")})
 
         self.add_custom_update(
-            genn_model, softmax_3, 
-            "Softmax3", 
-            "CUSoftmax3" + genn_pop.name)
+            genn_model, softmax_3, "Softmax3", "CUSoftmax3" + genn_pop.name
+        )
 
-    def _create_optimiser_custom_update(self, name_suffix, var_ref,
-                                        gradient_ref, genn_model):
+    def _create_optimiser_custom_update(
+        self, name_suffix, var_ref, gradient_ref, genn_model
+    ):
         # If batch size is greater than 1
         if self.full_batch_size > 1:
-            # Create custom update model to reduce Gradient into a variable 
+            # Create custom update model to reduce Gradient into a variable
             reduction_optimiser_model = CustomUpdateModel(
-                gradient_batch_reduce_model, {}, {"ReducedGradient": 0.0},
-                {"Gradient": gradient_ref})
+                gradient_batch_reduce_model,
+                {},
+                {"ReducedGradient": 0.0},
+                {"Gradient": gradient_ref},
+            )
 
             # Add GeNN custom update to model
             genn_reduction = self.add_custom_update(
-                genn_model, reduction_optimiser_model, 
-                "GradientBatchReduce", "CUBatchReduce" + name_suffix)
+                genn_model,
+                reduction_optimiser_model,
+                "GradientBatchReduce",
+                "CUBatchReduce" + name_suffix,
+            )
 
             # Create optimiser model without gradient zeroing
             # logic, connected to reduced gradient
-            reduced_gradient = create_wu_var_ref(genn_reduction,
-                                                 "ReducedGradient")
-            optimiser_model = self._optimiser.get_model(reduced_gradient, 
-                                                        var_ref, False)
+            reduced_gradient = create_wu_var_ref(genn_reduction, "ReducedGradient")
+            optimiser_model = self._optimiser.get_model(
+                reduced_gradient, var_ref, False
+            )
         # Otherwise
         else:
-            # Create optimiser model with gradient zeroing 
+            # Create optimiser model with gradient zeroing
             # logic, connected directly to population
-            optimiser_model = self._optimiser.get_model(
-                gradient_ref, var_ref, True)
+            optimiser_model = self._optimiser.get_model(gradient_ref, var_ref, True)
 
         # Add GeNN custom update to model
-        return self.add_custom_update(genn_model, optimiser_model,
-                                      "GradientLearn",
-                                      "CUGradientLearn" + name_suffix)
+        return self.add_custom_update(
+            genn_model,
+            optimiser_model,
+            "GradientLearn",
+            "CUGradientLearn" + name_suffix,
+        )
